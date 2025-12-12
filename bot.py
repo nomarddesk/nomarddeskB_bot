@@ -1,185 +1,255 @@
-import os
-import re
+import logging
+from telegram import Update, Bot
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes,
+    ConversationHandler
+)
+from telegram.constants import ParseMode
 import io
-import time
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from google.cloud import vision
-import gspread
+import os
+from datetime import datetime
 
-# --- CONFIGURATION (UPDATE THESE VALUES) ---
+from config import BOT_TOKEN
+from image_processor import ReceiptProcessor
+from google_sheets import GoogleSheetsHandler
 
-# 1. Telegram Bot Token
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# 2. Google Sheet Configuration
-SHEET_ID = "YOUR_GOOGLE_SHEET_ID"  # The ID from the URL
-CREDS_FILE = "service_account.json"  # Rename your downloaded JSON file to this
+# States for conversation
+WAITING_FOR_RECEIPT, CONFIRM_DATA = range(2)
 
-# 3. Google Cloud Vision Authentication
-# IMPORTANT: This line is crucial for Google Cloud Vision API to find your credentials.
-# Replace 'path/to/your/json/keyfile.json' with the actual path if it's not in the same directory.
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDS_FILE 
-# Note: Since the vision client is initialized inside a function, we will pass the file content if needed, 
-# but for a simple local setup, setting the environment variable is standard. 
-# We'll stick to passing the image content directly for simplicity.
-
-# ---------------------------------------------
-
-
-# --- 1. GOOGLE SHEETS & VISION CLIENTS ---
-
-# Initialize gspread client
-try:
-    gc = gspread.service_account(filename=CREDS_FILE)
-    spreadsheet = gc.open_by_key(SHEET_ID)
-    worksheet = spreadsheet.sheet1  # Assumes you are using the first sheet (Sheet1)
-    print("✅ Google Sheets connection established.")
-except Exception as e:
-    print(f"❌ Error connecting to Google Sheets: {e}")
-    # Exit or handle error gracefully in a production bot
-
-vision_client = vision.ImageAnnotatorClient()
-
-
-# --- 2. CORE LOGIC FUNCTIONS ---
-
-def perform_ocr(image_bytes: bytes) -> str:
-    """Detects text in the image using Google Cloud Vision."""
-    image = vision.Image(content=image_bytes)
-
-    # Use DOCUMENT_TEXT_DETECTION for dense text like receipts
-    response = vision_client.document_text_detection(image=image)
-    
-    if response.full_text_annotation:
-        return response.full_text_annotation.text
-    return ""
-
-def parse_receipt_data(raw_text: str) -> dict:
-    """
-    Analyzes the raw text to extract structured receipt data.
-    
-    NOTE: This is the most challenging part. The RegEx patterns below 
-    are basic examples and may need to be expanded for different receipt formats.
-    """
-    
-    # Simple RegEx for Total: looks for keywords like TOTAL, SUB, AMOUNT followed by a number
-    # (can include $ or € and has two decimal places)
-    total_match = re.search(r'(TOTAL|GRAND\s*TOTAL|AMOUNT\s*DUE|SUBTOTAL)\s*[:\$€]?\s*(\d+[\.,]\d{2})', 
-                            raw_text, re.IGNORECASE)
-    
-    # Simple RegEx for Date: looks for various date formats (DD/MM/YY, MM-DD-YYYY, etc.)
-    date_match = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', raw_text)
-
-    # Simple Vendor Name: Takes the first non-numeric line (very weak, but a starting point)
-    vendor_name = "Unknown Vendor"
-    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
-    if lines:
-        for line in lines:
-            if not re.search(r'\d', line) and len(line) > 3:
-                vendor_name = line
-                break
-    
-    # Format the total amount correctly
-    total_amount = total_match.group(2).replace(',', '.') if total_match else "N/A"
-    
-    return {
-        "Date": date_match.group(1) if date_match else "N/A",
-        "Vendor": vendor_name,
-        "Total Amount": total_amount,
-        "Raw Text": raw_text.replace('\n', ' | '), # Replace newlines for spreadsheet cell
-        "Timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-def save_to_sheet(data: dict) -> None:
-    """Appends the parsed data as a new row in the Google Sheet."""
-    # The order of this list must match the column order in your Google Sheet!
-    row_data = [
-        data.get("Timestamp"),
-        data.get("Date"), 
-        data.get("Vendor"), 
-        data.get("Total Amount"), 
-        data.get("Raw Text")
-    ]
-    worksheet.append_row(row_data)
-
-
-# --- 3. TELEGRAM BOT HANDLER ---
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message with instructions."""
-    await update.message.reply_text(
-        "👋 Hello! Send me a photo of your receipt, and I will extract the text and save the data to your Google Sheet."
-    )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles incoming photos, runs OCR, processes data, and saves to Google Sheets."""
-    
-    # 1. User Feedback
-    await update.message.reply_text("🔎 Receipt received. Please wait while I analyze the image...")
-    
-    try:
-        # 2. Get the highest quality file and download it as bytes
-        photo_file = await update.message.photo[-1].get_file()
+class ReceiptBot:
+    def __init__(self):
+        self.bot_token = BOT_TOKEN
+        self.gs_handler = GoogleSheetsHandler()
+        self.user_data_cache = {}
         
-        # Download the file content into an in-memory buffer (BytesIO)
-        file_bytes = io.BytesIO()
-        await photo_file.download_to_memory(file_bytes)
-        image_bytes = file_bytes.getvalue()
-        
-        # 3. Perform OCR
-        raw_text = perform_ocr(image_bytes)
-        
-        if not raw_text:
-            await update.message.reply_text("⚠️ Could not detect any text on the image. Please try a clearer photo.")
-            return
-
-        # 4. Parse the data
-        parsed_data = parse_receipt_data(raw_text)
-        
-        # 5. Save to Google Sheets
-        save_to_sheet(parsed_data)
-        
-        # 6. Confirmation Message
-        confirmation_message = (
-            f"✅ **Receipt Saved Successfully!**\n\n"
-            f"**Vendor:** {parsed_data['Vendor']}\n"
-            f"**Date:** {parsed_data['Date']}\n"
-            f"**Total:** {parsed_data['Total Amount']}\n\n"
-            f"View your sheet: [Link to your sheet](https://docs.google.com/spreadsheets/d/{SHEET_ID})"
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a welcome message when the command /start is issued."""
+        user = update.effective_user
+        welcome_message = (
+            f"👋 Hello {user.first_name}!\n\n"
+            "I'm your Receipt Recording Bot! 📄\n\n"
+            "Send me a photo of your receipt and I'll:\n"
+            "1. 📸 Extract text from the image\n"
+            "2. 🔍 Parse important information\n"
+            "3. 📊 Save it to Google Sheets\n\n"
+            "Just send me a receipt photo to get started!"
         )
-        await update.message.reply_markdown(confirmation_message)
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        await update.message.reply_text(f"❌ An error occurred during processing. Check the logs for details.")
-
-# --- 4. BOT RUNNER ---
+        
+        await update.message.reply_text(welcome_message)
+        return WAITING_FOR_RECEIPT
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send a help message."""
+        help_text = (
+            "📋 **How to use this bot:**\n\n"
+            "1. Take a clear photo of your receipt\n"
+            "2. Send it to this bot\n"
+            "3. The bot will extract and display the information\n"
+            "4. Confirm to save it to Google Sheets\n\n"
+            "**Tips for better results:**\n"
+            "• Ensure good lighting\n"
+            "• Keep the receipt flat\n"
+            "• Capture the entire receipt\n"
+            "• Avoid glare and shadows\n\n"
+            "Commands:\n"
+            "/start - Start the bot\n"
+            "/help - Show this help message\n"
+            "/cancel - Cancel current operation"
+        )
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def handle_receipt_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle receipt photo upload."""
+        user = update.effective_user
+        message = update.message
+        
+        if not message.photo:
+            await message.reply_text("Please send a photo of your receipt.")
+            return WAITING_FOR_RECEIPT
+        
+        # Get the highest quality photo
+        photo = message.photo[-1]
+        
+        # Inform user we're processing
+        processing_msg = await message.reply_text(
+            "🔄 Processing your receipt... Please wait."
+        )
+        
+        try:
+            # Download the photo
+            photo_file = await context.bot.get_file(photo.file_id)
+            photo_bytes = await photo_file.download_as_bytearray()
+            
+            # Process the image
+            extracted_text = ReceiptProcessor.extract_text(bytes(photo_bytes))
+            
+            if not extracted_text:
+                await processing_msg.edit_text(
+                    "❌ Could not extract text from the image. "
+                    "Please try again with a clearer photo."
+                )
+                return WAITING_FOR_RECEIPT
+            
+            # Parse receipt data
+            receipt_data = ReceiptProcessor.parse_receipt_text(extracted_text)
+            
+            # Add user info
+            receipt_data["user_id"] = user.id
+            receipt_data["username"] = user.username or user.first_name
+            receipt_data["raw_text"] = extracted_text[:1000]  # Limit raw text
+            receipt_data["image_file"] = f"{user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            
+            # Cache data for confirmation
+            self.user_data_cache[user.id] = {
+                "receipt_data": receipt_data,
+                "photo_bytes": photo_bytes
+            }
+            
+            # Prepare summary message
+            summary = self._format_receipt_summary(receipt_data)
+            
+            await processing_msg.edit_text(
+                f"✅ Text extracted successfully!\n\n"
+                f"{summary}\n\n"
+                f"Should I save this to Google Sheets? (Yes/No)"
+            )
+            
+            return CONFIRM_DATA
+            
+        except Exception as e:
+            logger.error(f"Error processing receipt: {e}")
+            await processing_msg.edit_text(
+                "❌ An error occurred while processing your receipt. "
+                "Please try again."
+            )
+            return WAITING_FOR_RECEIPT
+    
+    def _format_receipt_summary(self, receipt_data):
+        """Format receipt data for display."""
+        summary = (
+            f"🏪 **Store:** {receipt_data.get('store_name', 'Not found')}\n"
+            f"💰 **Total:** ${receipt_data.get('total_amount', '0.00')}\n"
+            f"📅 **Date:** {receipt_data.get('date', 'Not found')}\n"
+            f"⏰ **Time:** {receipt_data.get('time', 'Not found')}\n"
+            f"💳 **Payment:** {receipt_data.get('payment_method', 'Not found')}\n"
+        )
+        
+        if receipt_data.get('tax_amount'):
+            summary += f"🧾 **Tax:** ${receipt_data.get('tax_amount')}\n"
+        
+        return summary
+    
+    async def confirm_save(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle confirmation to save data."""
+        user = update.effective_user
+        message_text = update.message.text.lower()
+        
+        if user.id not in self.user_data_cache:
+            await update.message.reply_text(
+                "No receipt data found. Please send a receipt photo first."
+            )
+            return WAITING_FOR_RECEIPT
+        
+        if message_text in ['yes', 'y', 'save', 'confirm']:
+            # Save to Google Sheets
+            receipt_data = self.user_data_cache[user.id]["receipt_data"]
+            
+            saving_msg = await update.message.reply_text("💾 Saving to Google Sheets...")
+            
+            success = self.gs_handler.append_receipt_data(receipt_data)
+            
+            if success:
+                await saving_msg.edit_text(
+                    f"✅ Receipt data saved successfully!\n\n"
+                    f"📊 **Summary saved:**\n"
+                    f"• Store: {receipt_data.get('store_name')}\n"
+                    f"• Total: ${receipt_data.get('total_amount')}\n"
+                    f"• Date: {receipt_data.get('date')}\n\n"
+                    f"You can send another receipt or use /help for more options."
+                )
+            else:
+                await saving_msg.edit_text(
+                    "❌ Failed to save to Google Sheets. Please try again later."
+                )
+            
+            # Clear cache
+            del self.user_data_cache[user.id]
+            
+        elif message_text in ['no', 'n', 'cancel']:
+            await update.message.reply_text(
+                "❌ Receipt not saved. You can send another receipt if you'd like."
+            )
+            del self.user_data_cache[user.id]
+        else:
+            await update.message.reply_text(
+                "Please reply with 'Yes' to save or 'No' to cancel."
+            )
+            return CONFIRM_DATA
+        
+        return WAITING_FOR_RECEIPT
+    
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel the current operation."""
+        user = update.effective_user
+        
+        if user.id in self.user_data_cache:
+            del self.user_data_cache[user.id]
+        
+        await update.message.reply_text(
+            "Operation cancelled. Send a receipt photo to start again."
+        )
+        return ConversationHandler.END
+    
+    def run(self):
+        """Run the bot."""
+        # Create the Application
+        application = Application.builder().token(self.bot_token).build()
+        
+        # Create conversation handler
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler('start', self.start)],
+            states={
+                WAITING_FOR_RECEIPT: [
+                    MessageHandler(filters.PHOTO, self.handle_receipt_photo),
+                    CommandHandler('help', self.help_command),
+                    CommandHandler('cancel', self.cancel)
+                ],
+                CONFIRM_DATA: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.confirm_save),
+                    CommandHandler('cancel', self.cancel)
+                ]
+            },
+            fallbacks=[CommandHandler('cancel', self.cancel)]
+        )
+        
+        # Add handlers
+        application.add_handler(conv_handler)
+        application.add_handler(CommandHandler('help', self.help_command))
+        
+        # Start the bot
+        print("🤖 Bot is starting...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
-    """Starts the bot."""
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
+    """Main function to run the bot."""
+    if not BOT_TOKEN:
+        print("❌ Error: BOT_TOKEN not found in environment variables!")
+        print("Please create a .env file with your Telegram Bot Token.")
+        return
     
-    # Handler for any photo message
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
-    
-    # Start the Bot
-    print("🤖 Bot is running...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    bot = ReceiptBot()
+    bot.run()
 
 if __name__ == '__main__':
-    # Add an instruction to the user's terminal
-    print(f"\n* IMPORTANT: Ensure your Google Sheet has the following header row in Sheet1 (A1:E1):")
-    print(f"| Timestamp | Date | Vendor | Total Amount | Raw Text |")
-    print(f"* Make sure '{CREDS_FILE}' is in the same directory and shared with the Service Account email.")
-    print("-" * 50)
-    
-    # Check for placeholder tokens
-    if BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or SHEET_ID == "YOUR_GOOGLE_SHEET_ID":
-        print("🚨 Please update BOT_TOKEN and SHEET_ID in the script before running.")
-    else:
-        main()
+    main()
