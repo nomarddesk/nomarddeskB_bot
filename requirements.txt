@@ -10,3 +10,4 @@ opencv-python-headless==4.9.0.80  # Use headless version for server
 numpy==2.1.2
 python-dotenv==1.0.0
 httplib2==0.22.0
+openai==1.30.5
