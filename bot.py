@@ -3,6 +3,7 @@ import json
 import base64
 import logging
 import asyncio
+import traceback
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from telegram.ext import (
     CallbackQueryHandler, 
     ConversationHandler
 )
+from telegram.error import Conflict
 
 # Setup logging
 logging.basicConfig(
@@ -58,11 +60,13 @@ class OpenAIAnalyzer:
         
         if api_key:
             try:
-                # Try to import OpenAI
-                from openai import OpenAI
-                self.client = OpenAI(api_key=api_key)
+                # Try to import OpenAI - FIXED VERSION
+                import openai
+                # Set the API key directly
+                openai.api_key = api_key
+                self.client = openai
                 self.available = True
-                logger.info("✅ OpenAI initialized")
+                logger.info("✅ OpenAI initialized successfully")
             except ImportError:
                 logger.warning("OpenAI library not available")
             except Exception as e:
@@ -112,13 +116,13 @@ Rules:
 6. Date must be in YYYY-MM-DD format
 7. Extract transaction ID if available"""
             
-            # Call OpenAI API synchronously (OpenAI SDK doesn't have async for vision yet)
+            # Call OpenAI API using the legacy client pattern
             import asyncio
             from functools import partial
             
-            # Create a partial function for the sync call
             def make_openai_call():
-                return self.client.chat.completions.create(
+                # Using the legacy OpenAI client pattern
+                return self.client.ChatCompletion.create(
                     model="gpt-4-vision-preview",
                     messages=[
                         {
@@ -183,6 +187,7 @@ Rules:
                 
         except Exception as e:
             logger.error(f"OpenAI analysis error: {str(e)}")
+            traceback.print_exc()
             return ReceiptData()
     
     def format_receipt_for_display(self, receipt: ReceiptData) -> str:
@@ -265,6 +270,7 @@ class GoogleSheetManager:
             logger.error("Google Sheets libraries not installed")
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets: {e}")
+            traceback.print_exc()
             self.sheet = None
     
     def _setup_headers(self):
@@ -348,6 +354,7 @@ class GoogleSheetManager:
             
         except Exception as e:
             logger.error(f"Error adding transaction: {e}")
+            traceback.print_exc()
             return False
     
     def get_transactions(self, name: str = None) -> List[Dict]:
@@ -547,6 +554,7 @@ I can automatically scan and analyze your payment receipts!
                 
         except Exception as e:
             logger.error(f"Error handling photo: {str(e)}")
+            traceback.print_exc()
             await update.message.reply_text(
                 f"❌ Error processing image: {str(e)}\n\n"
                 "Please try again or enter details manually with /add"
@@ -943,9 +951,27 @@ I can automatically scan and analyze your payment receipts!
         context.user_data.clear()
         await update.message.reply_text("❌ Operation cancelled.")
         return ConversationHandler.END
+    
+    async def error_handler(self, update: Update, context: CallbackContext):
+        """Handle errors"""
+        logger.error(f"Exception while handling update: {context.error}")
+        
+        # Check if it's a conflict error
+        if isinstance(context.error, Conflict):
+            logger.error("Bot conflict detected. Restarting polling...")
+            # This will be handled by the restart logic in main
+        
+        # Try to notify user
+        try:
+            if update and update.effective_message:
+                await update.effective_message.reply_text(
+                    "❌ An error occurred. Please try again."
+                )
+        except:
+            pass
 
 def main():
-    """Start the bot"""
+    """Start the bot with conflict handling"""
     print("🚀 Starting AI Payment Receipt Bot...")
     print("=" * 50)
     
@@ -971,8 +997,11 @@ def main():
     # Initialize bot
     bot = AIReceiptBot()
     
-    # Create application with webhook to avoid conflict
+    # Create application with conflict handling
     app = Application.builder().token(token).build()
+    
+    # Add error handler
+    app.add_error_handler(bot.error_handler)
     
     # Add commands
     app.add_handler(CommandHandler("start", bot.start))
@@ -988,7 +1017,7 @@ def main():
     # Button handler
     app.add_handler(CallbackQueryHandler(bot.button_handler, pattern="^(save_ai|edit_manual|cancel)$"))
     
-    # Conversation handler for manual entry
+    # Conversation handler for manual entry - WITHOUT per_message=True
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("add", bot.add_manual),
@@ -1000,8 +1029,7 @@ def main():
             DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.get_date)],
             CATEGORY: [CallbackQueryHandler(bot.get_category)]
         },
-        fallbacks=[CommandHandler("cancel", bot.cancel)],
-        per_message=True  # Add this to fix conversation tracking
+        fallbacks=[CommandHandler("cancel", bot.cancel)]
     )
     
     app.add_handler(conv_handler)
@@ -1012,11 +1040,39 @@ def main():
     print("📸 Try sending a payment receipt screenshot!")
     print("=" * 50)
     
-    # Use specific update types and drop pending updates to avoid conflict
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True  # This will clear any pending updates
-    )
+    # Use webhook settings to avoid conflict
+    try:
+        # Try to stop any existing webhook first
+        import requests
+        requests.get(f"https://api.telegram.org/bot{token}/deleteWebhook")
+    except:
+        pass
+    
+    # Start polling with conflict resolution
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1} to start bot...")
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,  # Clear any pending updates
+                close_loop=False,
+                stop_signals=None  # Don't handle signals
+            )
+            break
+        except Conflict as e:
+            print(f"Conflict detected on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                print("Waiting 5 seconds before retry...")
+                import time
+                time.sleep(5)
+            else:
+                print("Max retries reached. Could not start bot due to conflict.")
+                raise
+        except Exception as e:
+            print(f"Error starting bot: {e}")
+            traceback.print_exc()
+            break
 
 if __name__ == '__main__':
     main()
