@@ -18,24 +18,6 @@ from telegram.ext import (
     ConversationHandler
 )
 
-# Google Sheets
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    GOOGLE_AVAILABLE = True
-except ImportError:
-    GOOGLE_AVAILABLE = False
-    print("Google Sheets not available")
-
-# OpenAI
-try:
-    from openai import AsyncOpenAI
-    import httpx
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("OpenAI not available")
-
 # Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -72,21 +54,19 @@ class OpenAIAnalyzer:
     
     def __init__(self, api_key: str = None):
         self.client = None
-        self.available = OPENAI_AVAILABLE
+        self.available = False
         
-        if api_key and OPENAI_AVAILABLE:
+        if api_key:
             try:
-                # Create async client with timeout
-                self.client = AsyncOpenAI(
-                    api_key=api_key,
-                    timeout=httpx.Timeout(30.0, connect=10.0)
-                )
+                # Try to import OpenAI
+                from openai import OpenAI
+                self.client = OpenAI(api_key=api_key)
+                self.available = True
                 logger.info("✅ OpenAI initialized")
+            except ImportError:
+                logger.warning("OpenAI library not available")
             except Exception as e:
                 logger.error(f"OpenAI init failed: {e}")
-                self.available = False
-        else:
-            self.available = False
     
     async def analyze_receipt(self, image_bytes: bytes) -> ReceiptData:
         """Analyze receipt image using GPT-4 Vision"""
@@ -132,26 +112,34 @@ Rules:
 6. Date must be in YYYY-MM-DD format
 7. Extract transaction ID if available"""
             
-            # Call OpenAI API with longer timeout
-            response = await self.client.chat.completions.create(
-                model="gpt-4-vision-preview",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_b64}"
+            # Call OpenAI API synchronously (OpenAI SDK doesn't have async for vision yet)
+            import asyncio
+            from functools import partial
+            
+            # Create a partial function for the sync call
+            def make_openai_call():
+                return self.client.chat.completions.create(
+                    model="gpt-4-vision-preview",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{image_b64}"
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=1500,
-                temperature=0.1
-            )
+                            ]
+                        }
+                    ],
+                    max_tokens=1500,
+                    temperature=0.1
+                )
+            
+            # Run in thread pool to avoid blocking
+            response = await asyncio.get_event_loop().run_in_executor(None, make_openai_call)
             
             # Parse response
             content = response.choices[0].message.content
@@ -240,15 +228,15 @@ class GoogleSheetManager:
     """Manages Google Sheets operations"""
     
     def __init__(self):
-        if not GOOGLE_AVAILABLE:
-            raise ImportError("Google Sheets libraries not available")
-        
         self.sheet = None
         self._initialize()
     
     def _initialize(self):
         """Initialize Google Sheets connection"""
         try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+            
             creds_json = os.getenv('GOOGLE_CREDS_JSON')
             sheet_url = os.getenv('SHEET_URL')
             
@@ -273,6 +261,8 @@ class GoogleSheetManager:
             
             logger.info("✅ Google Sheets initialized")
             
+        except ImportError:
+            logger.error("Google Sheets libraries not installed")
         except Exception as e:
             logger.error(f"Failed to initialize Google Sheets: {e}")
             self.sheet = None
@@ -414,13 +404,7 @@ class AIReceiptBot:
         self.ai_analyzer = OpenAIAnalyzer(openai_key)
         
         # Initialize Google Sheets
-        self.sheets = None
-        if GOOGLE_AVAILABLE:
-            try:
-                self.sheets = GoogleSheetManager()
-                logger.info("✅ Google Sheets ready")
-            except Exception as e:
-                logger.error(f"Google Sheets failed: {e}")
+        self.sheets = GoogleSheetManager()
         
         logger.info("🤖 AI Receipt Bot initialized")
     
@@ -509,11 +493,6 @@ I can automatically scan and analyze your payment receipts!
             context.user_data['user_id'] = user.id
             context.user_data['user_name'] = user.full_name
             
-            # Check image size
-            if len(image_bytes) < 1024:  # Less than 1KB
-                await update.message.reply_text("❌ Image is too small. Please send a clearer screenshot.")
-                return
-            
             # Start AI analysis
             await update.message.reply_text("🤖 AI is analyzing your payment receipt...")
             
@@ -591,27 +570,26 @@ I can automatically scan and analyze your payment receipts!
                 transaction_name = "Payment"
             
             # Save to Google Sheets
-            if self.sheets:
-                transaction_data = {
-                    'user_id': context.user_data.get('user_id'),
-                    'user_name': context.user_data.get('user_name'),
-                    'name': transaction_name,
-                    'amount': receipt_data.total_amount,
-                    'currency': receipt_data.currency,
-                    'date': receipt_data.date,
-                    'category': 'Payment',
-                    'store': receipt_data.store_name,
-                    'recipient': receipt_data.recipient,
-                    'transaction_id': receipt_data.transaction_id,
-                    'description': receipt_data.summary,
-                    'items': receipt_data.items,
-                    'confidence': receipt_data.confidence,
-                    'summary': receipt_data.summary,
-                    'has_image': True
-                }
-                
-                if self.sheets.add_transaction(transaction_data):
-                    response = f"""
+            transaction_data = {
+                'user_id': context.user_data.get('user_id'),
+                'user_name': context.user_data.get('user_name'),
+                'name': transaction_name,
+                'amount': receipt_data.total_amount,
+                'currency': receipt_data.currency,
+                'date': receipt_data.date,
+                'category': 'Payment',
+                'store': receipt_data.store_name,
+                'recipient': receipt_data.recipient,
+                'transaction_id': receipt_data.transaction_id,
+                'description': receipt_data.summary,
+                'items': receipt_data.items,
+                'confidence': receipt_data.confidence,
+                'summary': receipt_data.summary,
+                'has_image': True
+            }
+            
+            if self.sheets.add_transaction(transaction_data):
+                response = f"""
 ✅ **Payment Saved Successfully!**
 
 🤖 **AI Analysis:**
@@ -619,18 +597,16 @@ I can automatically scan and analyze your payment receipts!
 💰 **Amount:** {receipt_data.currency} {receipt_data.total_amount:,.2f}
 📅 **Date:** {receipt_data.date}
 """
-                    
-                    if receipt_data.transaction_id:
-                        response += f"🔢 **Transaction ID:** {receipt_data.transaction_id[:15]}...\n"
-                    
-                    response += f"🎯 **Confidence:** {receipt_data.confidence * 100:.1f}%\n\n"
-                    response += "💾 **Saved to Google Sheets**"
-                    
-                    await query.edit_message_text(response)
-                else:
-                    await query.edit_message_text("❌ Failed to save to Google Sheets. Please check setup.")
+                
+                if receipt_data.transaction_id:
+                    response += f"🔢 **Transaction ID:** {receipt_data.transaction_id[:15]}...\n"
+                
+                response += f"🎯 **Confidence:** {receipt_data.confidence * 100:.1f}%\n\n"
+                response += "💾 **Saved to Google Sheets**"
+                
+                await query.edit_message_text(response)
             else:
-                await query.edit_message_text("❌ Google Sheets not available.")
+                await query.edit_message_text("❌ Failed to save to Google Sheets. Please check setup.")
             
             context.user_data.clear()
             
@@ -777,28 +753,27 @@ I can automatically scan and analyze your payment receipts!
         context.user_data['category'] = category
         
         # Save transaction
-        if self.sheets:
-            receipt_data = context.user_data.get('receipt_data', ReceiptData())
-            
-            transaction_data = {
-                'user_id': context.user_data.get('user_id'),
-                'user_name': context.user_data.get('user_name'),
-                'name': context.user_data.get('name'),
-                'amount': context.user_data.get('amount'),
-                'currency': 'NGN',
-                'date': context.user_data.get('date'),
-                'category': category,
-                'store': context.user_data.get('name'),
-                'recipient': context.user_data.get('name'),
-                'description': receipt_data.summary if receipt_data else '',
-                'items': receipt_data.items if receipt_data else [],
-                'confidence': receipt_data.confidence if receipt_data else 0,
-                'summary': receipt_data.summary if receipt_data else '',
-                'has_image': 'image_bytes' in context.user_data
-            }
-            
-            if self.sheets.add_transaction(transaction_data):
-                response = f"""
+        receipt_data = context.user_data.get('receipt_data', ReceiptData())
+        
+        transaction_data = {
+            'user_id': context.user_data.get('user_id'),
+            'user_name': context.user_data.get('user_name'),
+            'name': context.user_data.get('name'),
+            'amount': context.user_data.get('amount'),
+            'currency': 'NGN',
+            'date': context.user_data.get('date'),
+            'category': category,
+            'store': context.user_data.get('name'),
+            'recipient': context.user_data.get('name'),
+            'description': receipt_data.summary if receipt_data else '',
+            'items': receipt_data.items if receipt_data else [],
+            'confidence': receipt_data.confidence if receipt_data else 0,
+            'summary': receipt_data.summary if receipt_data else '',
+            'has_image': 'image_bytes' in context.user_data
+        }
+        
+        if self.sheets.add_transaction(transaction_data):
+            response = f"""
 ✅ **Payment Saved!**
 
 📝 **Recipient:** {transaction_data['name']}
@@ -808,25 +783,19 @@ I can automatically scan and analyze your payment receipts!
 
 💾 Saved to Google Sheets
 """
-                
-                if 'image_bytes' in context.user_data:
-                    response += "📸 Includes receipt image\n"
-                
-                await query.edit_message_text(response)
-            else:
-                await query.edit_message_text("❌ Failed to save. Please check Google Sheets setup.")
+            
+            if 'image_bytes' in context.user_data:
+                response += "📸 Includes receipt image\n"
+            
+            await query.edit_message_text(response)
         else:
-            await query.edit_message_text("❌ Google Sheets not available.")
+            await query.edit_message_text("❌ Failed to save. Please check Google Sheets setup.")
         
         context.user_data.clear()
         return ConversationHandler.END
     
     async def search_transactions(self, update: Update, context: CallbackContext):
         """Handle /search command"""
-        if not self.sheets:
-            await update.message.reply_text("❌ Google Sheets not available.")
-            return
-        
         if context.args:
             name = ' '.join(context.args)
             transactions = self.sheets.get_transactions(name)
@@ -869,10 +838,6 @@ I can automatically scan and analyze your payment receipts!
     
     async def total_command(self, update: Update, context: CallbackContext):
         """Handle /total command"""
-        if not self.sheets:
-            await update.message.reply_text("❌ Google Sheets not available.")
-            return
-        
         name = ' '.join(context.args) if context.args else None
         
         total = self.sheets.get_total(name)
@@ -918,10 +883,6 @@ I can automatically scan and analyze your payment receipts!
     
     async def list_names(self, update: Update, context: CallbackContext):
         """Handle /list command"""
-        if not self.sheets:
-            await update.message.reply_text("❌ Google Sheets not available.")
-            return
-        
         names = self.sheets.get_names()
         
         if not names:
@@ -943,10 +904,6 @@ I can automatically scan and analyze your payment receipts!
     
     async def stats_command(self, update: Update, context: CallbackContext):
         """Handle /stats command for statistics"""
-        if not self.sheets:
-            await update.message.reply_text("❌ Google Sheets not available.")
-            return
-        
         # Get all transactions
         transactions = self.sheets.get_transactions()
         
@@ -1014,7 +971,7 @@ def main():
     # Initialize bot
     bot = AIReceiptBot()
     
-    # Create application
+    # Create application with webhook to avoid conflict
     app = Application.builder().token(token).build()
     
     # Add commands
@@ -1043,18 +1000,23 @@ def main():
             DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot.get_date)],
             CATEGORY: [CallbackQueryHandler(bot.get_category)]
         },
-        fallbacks=[CommandHandler("cancel", bot.cancel)]
+        fallbacks=[CommandHandler("cancel", bot.cancel)],
+        per_message=True  # Add this to fix conversation tracking
     )
     
     app.add_handler(conv_handler)
     
-    # Start bot
-    print("🤖 Bot is running...")
+    # Start bot with specific parameters to avoid conflict
+    print("🤖 Bot is starting...")
     print("📱 Visit Telegram and send /start to your bot")
     print("📸 Try sending a payment receipt screenshot!")
     print("=" * 50)
     
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Use specific update types and drop pending updates to avoid conflict
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True  # This will clear any pending updates
+    )
 
 if __name__ == '__main__':
     main()
