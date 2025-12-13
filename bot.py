@@ -6,7 +6,6 @@ import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from io import BytesIO
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,18 +30,11 @@ except ImportError:
 # OpenAI
 try:
     from openai import AsyncOpenAI
+    import httpx
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
     print("OpenAI not available")
-
-# Image processing
-try:
-    from PIL import Image
-    PILLOW_AVAILABLE = True
-except ImportError:
-    PILLOW_AVAILABLE = False
-    print("Pillow not available")
 
 # Setup logging
 logging.basicConfig(
@@ -64,10 +56,12 @@ class ReceiptData:
     store_name: str = ""
     total_amount: float = 0.0
     date: str = ""
-    currency: str = "USD"
+    currency: str = "NGN"
     items: List[Dict] = None
     summary: str = ""
     confidence: float = 0.0
+    recipient: str = ""
+    transaction_id: str = ""
     
     def __post_init__(self):
         if self.items is None:
@@ -82,7 +76,11 @@ class OpenAIAnalyzer:
         
         if api_key and OPENAI_AVAILABLE:
             try:
-                self.client = AsyncOpenAI(api_key=api_key)
+                # Create async client with timeout
+                self.client = AsyncOpenAI(
+                    api_key=api_key,
+                    timeout=httpx.Timeout(30.0, connect=10.0)
+                )
                 logger.info("✅ OpenAI initialized")
             except Exception as e:
                 logger.error(f"OpenAI init failed: {e}")
@@ -100,30 +98,41 @@ class OpenAIAnalyzer:
             # Encode image to base64
             image_b64 = base64.b64encode(image_bytes).decode('utf-8')
             
-            # Prepare prompt for receipt analysis
-            prompt = """You are a receipt analysis expert. Analyze this receipt image and extract the following information in JSON format:
+            # Prepare prompt specifically for payment receipts
+            prompt = """You are a financial receipt analysis expert. Analyze this payment receipt image and extract the following information in JSON format:
 
 {
-    "store_name": "Name of the store/business",
+    "store_name": "Name of the store/business or recipient",
     "total_amount": 0.00,
     "date": "YYYY-MM-DD",
-    "currency": "USD or other",
+    "currency": "NGN or USD or other",
+    "recipient": "Name of recipient",
+    "transaction_id": "Transaction number if available",
     "items": [
-        {"name": "item name", "price": 0.00, "quantity": 1}
+        {"name": "item name or description", "price": 0.00}
     ],
-    "summary": "Brief description of purchase",
+    "summary": "Brief description of payment",
     "confidence": 0.95
 }
+
+IMPORTANT: This is a payment receipt, likely from a banking app or payment system. Look for:
+1. "PAY" or "Payment" text
+2. Amount in Naira (₦) or other currency
+3. Recipient name
+4. Transaction date
+5. Transaction ID/Number
+6. Status (Successful, Completed, etc.)
 
 Rules:
 1. Return ONLY valid JSON, no other text
 2. If date is not available, use today's date
-3. If total amount is not clear, estimate from items
-4. Confidence should be 0.0 to 1.0 based on how clear the receipt is
-5. Date must be in YYYY-MM-DD format
-6. Keep item list concise, max 10 items"""
+3. Convert amounts to numbers (remove commas, currency symbols)
+4. Look carefully for Naira amounts (₦ or NGN)
+5. Confidence should be 0.0 to 1.0
+6. Date must be in YYYY-MM-DD format
+7. Extract transaction ID if available"""
             
-            # Call OpenAI API
+            # Call OpenAI API with longer timeout
             response = await self.client.chat.completions.create(
                 model="gpt-4-vision-preview",
                 messages=[
@@ -140,20 +149,22 @@ Rules:
                         ]
                     }
                 ],
-                max_tokens=1000,
+                max_tokens=1500,
                 temperature=0.1
             )
             
             # Parse response
             content = response.choices[0].message.content
             
-            # Extract JSON from response
+            # Clean and parse JSON
             try:
                 # Clean the response
                 content = content.strip()
+                
+                # Remove markdown code blocks
                 if content.startswith("```json"):
                     content = content[7:]
-                if content.startswith("```"):
+                elif content.startswith("```"):
                     content = content[3:]
                 if content.endswith("```"):
                     content = content[:-3]
@@ -166,22 +177,24 @@ Rules:
                     store_name=data.get("store_name", ""),
                     total_amount=float(data.get("total_amount", 0)),
                     date=data.get("date", datetime.now().strftime('%Y-%m-%d')),
-                    currency=data.get("currency", "USD"),
+                    currency=data.get("currency", "NGN"),
+                    recipient=data.get("recipient", ""),
+                    transaction_id=data.get("transaction_id", ""),
                     items=data.get("items", []),
                     summary=data.get("summary", ""),
                     confidence=float(data.get("confidence", 0))
                 )
                 
-                logger.info(f"✅ AI analysis complete: {receipt.store_name} - ${receipt.total_amount}")
+                logger.info(f"✅ AI analysis complete: {receipt.store_name} - {receipt.currency} {receipt.total_amount}")
                 return receipt
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse AI response: {e}")
-                logger.error(f"Response: {content}")
+                logger.error(f"Response content: {content[:500]}")
                 return ReceiptData()
                 
         except Exception as e:
-            logger.error(f"OpenAI analysis error: {e}")
+            logger.error(f"OpenAI analysis error: {str(e)}")
             return ReceiptData()
     
     def format_receipt_for_display(self, receipt: ReceiptData) -> str:
@@ -190,25 +203,29 @@ Rules:
         lines.append("🤖 **AI Receipt Analysis**")
         lines.append("─" * 40)
         
-        if receipt.store_name:
-            lines.append(f"🏪 **Store:** {receipt.store_name}")
+        if receipt.store_name and receipt.store_name != "Unknown Store":
+            lines.append(f"🏪 **Store/Recipient:** {receipt.store_name}")
+        elif receipt.recipient:
+            lines.append(f"👤 **Recipient:** {receipt.recipient}")
         
         if receipt.total_amount > 0:
-            lines.append(f"💰 **Total:** {receipt.currency} {receipt.total_amount:.2f}")
+            lines.append(f"💰 **Amount:** {receipt.currency} {receipt.total_amount:,.2f}")
         
         if receipt.date:
             lines.append(f"📅 **Date:** {receipt.date}")
         
+        if receipt.transaction_id:
+            lines.append(f"🔢 **Transaction ID:** {receipt.transaction_id[:20]}...")
+        
         if receipt.items:
-            lines.append("\n🛒 **Items:**")
-            for i, item in enumerate(receipt.items[:5], 1):  # Show first 5 items
+            lines.append("\n📋 **Items:**")
+            for i, item in enumerate(receipt.items[:3], 1):
                 name = item.get('name', 'Item')
                 price = item.get('price', 0)
-                qty = item.get('quantity', 1)
-                lines.append(f"  {i}. {name} - {receipt.currency} {price:.2f} x{qty}")
+                lines.append(f"  {i}. {name} - {receipt.currency} {price:,.2f}")
             
-            if len(receipt.items) > 5:
-                lines.append(f"  ... and {len(receipt.items) - 5} more items")
+            if len(receipt.items) > 3:
+                lines.append(f"  ... and {len(receipt.items) - 3} more items")
         
         if receipt.summary:
             lines.append(f"\n📝 **Summary:** {receipt.summary}")
@@ -265,12 +282,12 @@ class GoogleSheetManager:
         try:
             existing = self.sheet.row_values(1)
             
-            if not existing or len(existing) < 10:
+            if not existing or len(existing) < 12:
                 headers = [
                     'ID', 'Timestamp', 'User ID', 'Username', 'Name',
-                    'Amount', 'Date', 'Category', 'Description',
-                    'Store', 'AI Confidence', 'Items Count', 'Currency',
-                    'AI Summary', 'Has Image'
+                    'Amount', 'Currency', 'Date', 'Category', 'Description',
+                    'Store', 'Recipient', 'Transaction ID', 'AI Confidence', 
+                    'Items Count', 'AI Summary', 'Has Image'
                 ]
                 self.sheet.insert_row(headers, 1)
                 logger.info("📝 Added headers to sheet")
@@ -287,7 +304,14 @@ class GoogleSheetManager:
             if not ids:
                 return 1
             
-            return max([int(id) for id in ids if id.isdigit()], default=0) + 1
+            numeric_ids = []
+            for id_str in ids:
+                try:
+                    numeric_ids.append(int(id_str))
+                except:
+                    continue
+            
+            return max(numeric_ids, default=0) + 1
         except:
             return 1
     
@@ -315,13 +339,15 @@ class GoogleSheetManager:
                 data.get('user_name', ''),
                 data.get('name', ''),
                 data.get('amount', 0),
+                data.get('currency', 'NGN'),
                 data.get('date', ''),
                 data.get('category', ''),
                 data.get('description', ''),
                 data.get('store', ''),
+                data.get('recipient', ''),
+                data.get('transaction_id', ''),
                 data.get('confidence', 0),
                 len(items),
-                data.get('currency', 'USD'),
                 data.get('summary', ''),
                 '✅' if data.get('has_image') else '❌'
             ]
@@ -400,43 +426,55 @@ class AIReceiptBot:
     
     async def start(self, update: Update, context: CallbackContext):
         """Handle /start command"""
-        user = update.effective_user
-        
-        welcome = f"""
-👋 Hello {user.first_name}!
+        welcome = """
+🤖 **AI Payment Receipt Tracker**
 
-🤖 **AI Receipt Tracker Bot**
+I can automatically scan and analyze your payment receipts!
 
-I'm powered by AI to automatically scan and analyze your receipts!
+**Send me a screenshot of:**
+• Bank transfer receipts
+• Payment confirmations  
+• Mobile money transactions
+• POS receipts
+• Any payment confirmation
 
-**What I can do:**
-• 📸 Scan receipt images using AI
-• 🧠 Extract store, amount, date, items
-• 💾 Save to Google Sheets
-• 🔍 Search and analyze expenses
+**I'll extract:**
+💰 Amount • 📅 Date • 👤 Recipient • 🏪 Store • 🔢 Transaction ID
 
 **Commands:**
-/start - Welcome message
 /add - Add manually
-/search [name] - Find transactions
+/search [name] - Search transactions
 /total [name] - Calculate total
 /list - List all names
-/help - Detailed help
+/help - Help guide
 
-**Just send me a receipt photo to get started!** 📸
+**Just send me a receipt screenshot to get started!** 📸
 """
         await update.message.reply_text(welcome)
     
     async def help_command(self, update: Update, context: CallbackContext):
         """Handle /help command"""
         help_text = """
-📚 **AI Receipt Bot Help**
+📚 **How to use this bot:**
 
-**Quick Start:**
-1. Send a receipt photo
-2. AI will analyze it automatically
-3. Confirm details
-4. ✅ Saved to Google Sheets
+1. **Take a screenshot** of any payment receipt:
+   - Bank app transfers
+   - Mobile money (OPay, Palmpay, etc.)
+   - POS receipts
+   - Online payment confirmations
+
+2. **Send the screenshot** to me
+
+3. **AI will analyze** and extract:
+   • Amount (NGN, USD, etc.)
+   • Date
+   • Recipient name
+   • Transaction ID
+   • Payment description
+
+4. **Confirm or edit** the details
+
+5. **✅ Saved to Google Sheets**
 
 **Commands:**
 • /start - Welcome message
@@ -446,15 +484,9 @@ I'm powered by AI to automatically scan and analyze your receipts!
 • /list - List all names
 • /stats - Get statistics
 
-**AI Features:**
-• Automatic receipt scanning
-• Itemized breakdown
-• Store name detection
-• Date and amount extraction
-
 **Example:**
 /search John
-/total Shopping
+/total November
 /list
 """
         await update.message.reply_text(help_text)
@@ -468,6 +500,8 @@ I'm powered by AI to automatically scan and analyze your receipts!
             # Download photo
             photo = update.message.photo[-1]
             file = await photo.get_file()
+            
+            # Download as bytes
             image_bytes = await file.download_as_bytearray()
             
             # Store in context
@@ -475,26 +509,28 @@ I'm powered by AI to automatically scan and analyze your receipts!
             context.user_data['user_id'] = user.id
             context.user_data['user_name'] = user.full_name
             
+            # Check image size
+            if len(image_bytes) < 1024:  # Less than 1KB
+                await update.message.reply_text("❌ Image is too small. Please send a clearer screenshot.")
+                return
+            
             # Start AI analysis
-            await update.message.reply_text("🤖 AI is analyzing your receipt...")
+            await update.message.reply_text("🤖 AI is analyzing your payment receipt...")
             
             # Analyze with OpenAI
             receipt_data = await self.ai_analyzer.analyze_receipt(image_bytes)
             context.user_data['receipt_data'] = receipt_data
             
             # Show analysis results
-            if receipt_data.store_name or receipt_data.total_amount > 0:
-                display_text = self.ai_analyzer.format_receipt_for_display(receipt_data)
-                
+            display_text = self.ai_analyzer.format_receipt_for_display(receipt_data)
+            
+            # Check if AI found anything useful
+            if receipt_data.total_amount > 0 or receipt_data.store_name or receipt_data.recipient:
                 # Add action buttons
                 keyboard = [
                     [
                         InlineKeyboardButton("✅ Save with AI Data", callback_data="save_ai"),
                         InlineKeyboardButton("✏️ Edit Details", callback_data="edit_manual")
-                    ],
-                    [
-                        InlineKeyboardButton("🔄 Re-analyze", callback_data="reanalyze"),
-                        InlineKeyboardButton("❌ Cancel", callback_data="cancel")
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -505,10 +541,17 @@ I'm powered by AI to automatically scan and analyze your receipts!
                     parse_mode='Markdown'
                 )
             else:
-                # AI analysis failed
+                # AI analysis failed or found nothing
                 await update.message.reply_text(
-                    "❌ AI couldn't analyze the receipt properly.\n\n"
-                    "Please enter details manually or try another photo."
+                    "❌ AI couldn't extract clear information from this image.\n\n"
+                    "**Try this:**\n"
+                    "1. Make sure the receipt is clearly visible\n"
+                    "2. Try a different screenshot\n"
+                    "3. Or enter details manually\n\n"
+                    "**Common issues:**\n"
+                    "• Blurry image\n"
+                    "• Text too small\n"
+                    "• Complex background"
                 )
                 
                 # Start manual entry
@@ -524,9 +567,10 @@ I'm powered by AI to automatically scan and analyze your receipts!
                 )
                 
         except Exception as e:
-            logger.error(f"Error handling photo: {e}")
+            logger.error(f"Error handling photo: {str(e)}")
             await update.message.reply_text(
-                "❌ Error processing image. Please try again or enter manually."
+                f"❌ Error processing image: {str(e)}\n\n"
+                "Please try again or enter details manually with /add"
             )
     
     async def button_handler(self, update: Update, context: CallbackContext):
@@ -536,45 +580,55 @@ I'm powered by AI to automatically scan and analyze your receipts!
         
         if query.data == "save_ai":
             # Save with AI data
-            receipt_data = context.user_data.get('receipt_data')
+            receipt_data = context.user_data.get('receipt_data', ReceiptData())
             
-            if not receipt_data:
-                await query.edit_message_text("❌ No receipt data found.")
-                return
+            # Determine name for transaction
+            if receipt_data.recipient:
+                transaction_name = receipt_data.recipient
+            elif receipt_data.store_name and receipt_data.store_name != "Unknown Store":
+                transaction_name = receipt_data.store_name
+            else:
+                transaction_name = "Payment"
             
             # Save to Google Sheets
             if self.sheets:
                 transaction_data = {
                     'user_id': context.user_data.get('user_id'),
                     'user_name': context.user_data.get('user_name'),
-                    'name': receipt_data.store_name or "Receipt",
+                    'name': transaction_name,
                     'amount': receipt_data.total_amount,
+                    'currency': receipt_data.currency,
                     'date': receipt_data.date,
-                    'category': 'Shopping',
+                    'category': 'Payment',
                     'store': receipt_data.store_name,
+                    'recipient': receipt_data.recipient,
+                    'transaction_id': receipt_data.transaction_id,
                     'description': receipt_data.summary,
                     'items': receipt_data.items,
                     'confidence': receipt_data.confidence,
-                    'currency': receipt_data.currency,
                     'summary': receipt_data.summary,
                     'has_image': True
                 }
                 
                 if self.sheets.add_transaction(transaction_data):
                     response = f"""
-✅ **Saved Successfully!**
+✅ **Payment Saved Successfully!**
 
-🤖 AI Analysis Complete:
-🏪 Store: {receipt_data.store_name}
-💰 Total: {receipt_data.currency} {receipt_data.total_amount:.2f}
-📅 Date: {receipt_data.date}
-🎯 Confidence: {receipt_data.confidence * 100:.1f}%
-
-💾 Saved to Google Sheets
+🤖 **AI Analysis:**
+👤 **Recipient:** {transaction_name}
+💰 **Amount:** {receipt_data.currency} {receipt_data.total_amount:,.2f}
+📅 **Date:** {receipt_data.date}
 """
+                    
+                    if receipt_data.transaction_id:
+                        response += f"🔢 **Transaction ID:** {receipt_data.transaction_id[:15]}...\n"
+                    
+                    response += f"🎯 **Confidence:** {receipt_data.confidence * 100:.1f}%\n\n"
+                    response += "💾 **Saved to Google Sheets**"
+                    
                     await query.edit_message_text(response)
                 else:
-                    await query.edit_message_text("❌ Failed to save to Google Sheets.")
+                    await query.edit_message_text("❌ Failed to save to Google Sheets. Please check setup.")
             else:
                 await query.edit_message_text("❌ Google Sheets not available.")
             
@@ -585,7 +639,7 @@ I'm powered by AI to automatically scan and analyze your receipts!
             receipt_data = context.user_data.get('receipt_data', ReceiptData())
             
             # Pre-fill with AI data if available
-            default_name = receipt_data.store_name or ""
+            default_name = receipt_data.recipient or receipt_data.store_name or "Payment"
             default_amount = receipt_data.total_amount or 0
             default_date = receipt_data.date or datetime.now().strftime('%Y-%m-%d')
             
@@ -595,38 +649,10 @@ I'm powered by AI to automatically scan and analyze your receipts!
             
             await query.edit_message_text(
                 f"✏️ **Manual Entry**\n\n"
-                f"Store name (press Enter for '{default_name}'):"
+                f"Recipient/Store name (press Enter for '{default_name}'):"
             )
             return NAME
             
-        elif query.data == "reanalyze":
-            # Re-analyze the image
-            image_bytes = context.user_data.get('image_bytes')
-            
-            if image_bytes:
-                await query.edit_message_text("🔄 Re-analyzing with AI...")
-                
-                receipt_data = await self.ai_analyzer.analyze_receipt(image_bytes)
-                context.user_data['receipt_data'] = receipt_data
-                
-                display_text = self.ai_analyzer.format_receipt_for_display(receipt_data)
-                
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Save with AI Data", callback_data="save_ai"),
-                        InlineKeyboardButton("✏️ Edit Details", callback_data="edit_manual")
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await query.edit_message_text(
-                    display_text + "\n\n**What would you like to do?**",
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
-            else:
-                await query.edit_message_text("❌ No image found to re-analyze.")
-                
         elif query.data == "cancel":
             await query.edit_message_text("❌ Operation cancelled.")
             context.user_data.clear()
@@ -637,8 +663,8 @@ I'm powered by AI to automatically scan and analyze your receipts!
         context.user_data['user_name'] = update.effective_user.full_name
         
         await update.message.reply_text(
-            "✏️ **Manual Entry**\n\n"
-            "Enter the store or person's name:"
+            "✏️ **Manual Payment Entry**\n\n"
+            "Enter recipient or store name:"
         )
         return NAME
     
@@ -648,11 +674,7 @@ I'm powered by AI to automatically scan and analyze your receipts!
         
         if not name:
             # Use default if available
-            name = context.user_data.get('default_name', '')
-        
-        if not name:
-            await update.message.reply_text("❌ Name cannot be empty. Please enter a name:")
-            return NAME
+            name = context.user_data.get('default_name', 'Payment')
         
         context.user_data['name'] = name
         
@@ -661,10 +683,10 @@ I'm powered by AI to automatically scan and analyze your receipts!
         
         if default_amount > 0:
             await update.message.reply_text(
-                f"💰 Amount (press Enter for ${default_amount:.2f}):"
+                f"💰 Amount in NGN (press Enter for ₦{default_amount:,.2f}):"
             )
         else:
-            await update.message.reply_text("💰 Enter the amount (e.g., 25.50):")
+            await update.message.reply_text("💰 Enter amount in NGN (e.g., 48000.00):")
         
         return AMOUNT
     
@@ -677,16 +699,12 @@ I'm powered by AI to automatically scan and analyze your receipts!
             amount = context.user_data.get('default_amount', 0)
         else:
             try:
-                # Clean amount string
-                amount_text = amount_text.replace('$', '').replace(',', '').strip()
+                # Clean amount string - handle Naira format
+                amount_text = amount_text.replace('₦', '').replace('NGN', '').replace(',', '').replace('$', '').strip()
                 amount = float(amount_text)
             except ValueError:
-                await update.message.reply_text("❌ Invalid amount. Please enter a number:")
+                await update.message.reply_text("❌ Invalid amount. Please enter a number (e.g., 48000.00):")
                 return AMOUNT
-        
-        if amount <= 0:
-            await update.message.reply_text("❌ Amount must be greater than 0. Please enter amount:")
-            return AMOUNT
         
         context.user_data['amount'] = amount
         
@@ -722,29 +740,29 @@ I'm powered by AI to automatically scan and analyze your receipts!
             )
             return DATE
         
-        # Category selection
+        # Category selection for payments
         keyboard = [
             [
-                InlineKeyboardButton("🍔 Food", callback_data="Food"),
+                InlineKeyboardButton("💸 Transfer", callback_data="Transfer"),
                 InlineKeyboardButton("🛍️ Shopping", callback_data="Shopping")
             ],
             [
-                InlineKeyboardButton("🚗 Transport", callback_data="Transport"),
-                InlineKeyboardButton("🏠 Bills", callback_data="Bills")
+                InlineKeyboardButton("🍔 Food", callback_data="Food"),
+                InlineKeyboardButton("🚗 Transport", callback_data="Transport")
             ],
             [
-                InlineKeyboardButton("🏥 Medical", callback_data="Medical"),
-                InlineKeyboardButton("🎬 Entertainment", callback_data="Entertainment")
+                InlineKeyboardButton("🏠 Bills", callback_data="Bills"),
+                InlineKeyboardButton("💼 Business", callback_data="Business")
             ],
             [
-                InlineKeyboardButton("💼 Business", callback_data="Business"),
+                InlineKeyboardButton("🎬 Entertainment", callback_data="Entertainment"),
                 InlineKeyboardButton("❓ Other", callback_data="Other")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "📊 Select category:",
+            "📊 Select payment category:",
             reply_markup=reply_markup
         )
         
@@ -767,25 +785,26 @@ I'm powered by AI to automatically scan and analyze your receipts!
                 'user_name': context.user_data.get('user_name'),
                 'name': context.user_data.get('name'),
                 'amount': context.user_data.get('amount'),
+                'currency': 'NGN',
                 'date': context.user_data.get('date'),
                 'category': category,
                 'store': context.user_data.get('name'),
+                'recipient': context.user_data.get('name'),
                 'description': receipt_data.summary if receipt_data else '',
                 'items': receipt_data.items if receipt_data else [],
                 'confidence': receipt_data.confidence if receipt_data else 0,
-                'currency': receipt_data.currency if receipt_data else 'USD',
                 'summary': receipt_data.summary if receipt_data else '',
                 'has_image': 'image_bytes' in context.user_data
             }
             
             if self.sheets.add_transaction(transaction_data):
                 response = f"""
-✅ **Transaction Saved!**
+✅ **Payment Saved!**
 
-📝 Name: {transaction_data['name']}
-💰 Amount: ${transaction_data['amount']:.2f}
-📅 Date: {transaction_data['date']}
-📊 Category: {transaction_data['category']}
+📝 **Recipient:** {transaction_data['name']}
+💰 **Amount:** ₦{transaction_data['amount']:,.2f}
+📅 **Date:** {transaction_data['date']}
+📊 **Category:** {transaction_data['category']}
 
 💾 Saved to Google Sheets
 """
@@ -826,15 +845,12 @@ I'm powered by AI to automatically scan and analyze your receipts!
                 
                 date = t.get('Date', 'N/A')[:10]
                 category = t.get('Category', 'N/A')
-                store = t.get('Store', '')
+                currency = t.get('Currency', 'NGN')
                 
-                response += f"{i}. **{date}** - ${amount:.2f}\n"
-                response += f"   📊 {category}"
-                if store:
-                    response += f" | 🏪 {store}"
-                response += "\n\n"
+                response += f"{i}. **{date}** - {currency} {amount:,.2f}\n"
+                response += f"   📊 {category}\n\n"
             
-            response += f"💰 **Total: ${total:.2f}**\n"
+            response += f"💰 **Total:** ₦{total:,.2f}\n"
             response += f"📈 {len(transactions)} transactions total"
             
             if len(transactions) > 10:
@@ -844,8 +860,8 @@ I'm powered by AI to automatically scan and analyze your receipts!
             await update.message.reply_text(
                 "🔍 **Search Transactions**\n\n"
                 "Usage: /search [name]\n"
-                "Example: /search John\n"
-                "Example: /search Starbucks"
+                "Example: /search Funke\n"
+                "Example: /search OPay"
             )
             return
         
@@ -871,8 +887,8 @@ I'm powered by AI to automatically scan and analyze your receipts!
 💰 **Financial Summary for {name}**
 
 📊 Total Transactions: {count}
-💰 Total Amount: ${total:.2f}
-📈 Average per transaction: ${avg:.2f}
+💰 Total Amount: ₦{total:,.2f}
+📈 Average per transaction: ₦{avg:,.2f}
 
 """
             
@@ -881,8 +897,9 @@ I'm powered by AI to automatically scan and analyze your receipts!
                 last = transactions[-1]
                 last_date = last.get('Date', '')[:10]
                 last_amount = float(last.get('Amount', 0))
+                last_currency = last.get('Currency', 'NGN')
                 
-                response += f"📅 Last transaction: {last_date} - ${last_amount:.2f}"
+                response += f"📅 Last transaction: {last_date} - {last_currency} {last_amount:,.2f}"
             
         else:
             # Overall total
@@ -894,7 +911,7 @@ I'm powered by AI to automatically scan and analyze your receipts!
 
 👥 People in database: {len(names)}
 📊 Total Transactions: {count}
-💰 Total Amount: ${total:.2f}
+💰 Total Amount: ₦{total:,.2f}
 """
         
         await update.message.reply_text(response)
@@ -911,16 +928,16 @@ I'm powered by AI to automatically scan and analyze your receipts!
             await update.message.reply_text("📭 No transactions yet. Send a receipt to get started!")
             return
         
-        response = "👥 **People in Database**\n\n"
+        response = "👥 **People/Stores in Database**\n\n"
         
         for i, name in enumerate(names, 1):
             total = self.sheets.get_total(name)
             count = len(self.sheets.get_transactions(name))
             
             response += f"{i}. **{name}**\n"
-            response += f"   📊 {count} transactions | 💰 ${total:.2f}\n\n"
+            response += f"   📊 {count} transactions | 💰 ₦{total:,.2f}\n\n"
         
-        response += f"📈 Total: {len(names)} people"
+        response += f"📈 Total: {len(names)} entries"
         
         await update.message.reply_text(response, parse_mode='Markdown')
     
@@ -954,23 +971,13 @@ I'm powered by AI to automatically scan and analyze your receipts!
         # Format response
         response = "📈 **Expense Statistics**\n\n"
         response += f"📊 Total Transactions: {len(transactions)}\n"
-        response += f"💰 Total Amount: ${total_amount:.2f}\n"
-        response += f"📈 Average: ${avg_amount:.2f}\n\n"
+        response += f"💰 Total Amount: ₦{total_amount:,.2f}\n"
+        response += f"📈 Average: ₦{avg_amount:,.2f}\n\n"
         
         response += "🏷️ **Spending by Category:**\n"
         for cat, amount in sorted_cats[:5]:  # Top 5 categories
             percentage = (amount / total_amount) * 100
-            response += f"• {cat}: ${amount:.2f} ({percentage:.1f}%)\n"
-        
-        # Most frequent store
-        stores = {}
-        for t in transactions:
-            store = t.get('Store', 'Unknown')
-            stores[store] = stores.get(store, 0) + 1
-        
-        if stores:
-            top_store = max(stores.items(), key=lambda x: x[1])
-            response += f"\n🏪 **Most Frequent Store:** {top_store[0]} ({top_store[1]} times)"
+            response += f"• {cat}: ₦{amount:,.2f} ({percentage:.1f}%)\n"
         
         await update.message.reply_text(response)
     
@@ -982,7 +989,7 @@ I'm powered by AI to automatically scan and analyze your receipts!
 
 def main():
     """Start the bot"""
-    print("🚀 Starting AI Receipt Bot...")
+    print("🚀 Starting AI Payment Receipt Bot...")
     print("=" * 50)
     
     # Check environment variables
@@ -997,6 +1004,12 @@ def main():
         print("⚠️ OPENAI_API_KEY not found - AI features will be disabled")
     else:
         print("✅ OpenAI API key found")
+    
+    # Check Google Sheets
+    if not os.getenv('GOOGLE_CREDS_JSON'):
+        print("⚠️ GOOGLE_CREDS_JSON not found")
+    if not os.getenv('SHEET_URL'):
+        print("⚠️ SHEET_URL not found")
     
     # Initialize bot
     bot = AIReceiptBot()
@@ -1016,7 +1029,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, bot.handle_photo))
     
     # Button handler
-    app.add_handler(CallbackQueryHandler(bot.button_handler, pattern="^(save_ai|edit_manual|reanalyze|cancel)$"))
+    app.add_handler(CallbackQueryHandler(bot.button_handler, pattern="^(save_ai|edit_manual|cancel)$"))
     
     # Conversation handler for manual entry
     conv_handler = ConversationHandler(
@@ -1038,7 +1051,7 @@ def main():
     # Start bot
     print("🤖 Bot is running...")
     print("📱 Visit Telegram and send /start to your bot")
-    print("📸 Try sending a receipt photo for AI analysis!")
+    print("📸 Try sending a payment receipt screenshot!")
     print("=" * 50)
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
