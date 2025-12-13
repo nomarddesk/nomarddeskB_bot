@@ -1,13 +1,9 @@
-# Updated requirements.txt for Python 3.13 compatibility
 python-telegram-bot[job-queue]==21.7
 gspread==6.0.0
 google-auth==2.29.0
-google-auth-oauthlib==1.2.0
-google-auth-httplib2==0.2.0
-Pillow==11.0.0  # Updated for Python 3.13 support
-pytesseract==0.3.10
-opencv-python-headless==4.9.0.80  # Use headless version for server
-numpy==2.1.2
 python-dotenv==1.0.0
 httplib2==0.22.0
 openai==1.30.5
+Pillow==10.3.0  # Compatible version
+requests==2.31.0
+aiohttp==3.9.5
